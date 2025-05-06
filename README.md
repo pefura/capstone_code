@@ -85,7 +85,7 @@ commodities_prices_world_bank_fertilizers_oil_2010-01-01_to_2025-03-31.csv
 # 6. Farm prices for wheat in US
 all_wheat_monthly_prices_200910_to_202425.csv
 
-# 7. Supply and peoduction of wheat in US
+# 7. Supply and production of wheat in US
 wheat_table05_monthly_approx_200910_to_202425.csv"
 
 # 8. Macroeconomic data
