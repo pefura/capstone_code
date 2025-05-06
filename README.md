@@ -49,3 +49,28 @@ Highlights:
    - WindSpeed — derived from u and v components.
 
 💾 Output: multi-variable, consolidated Zarr data store for easy integration with machine learning pipelines.
+
+# 3. Function: process_climate_daily()
+Purpose: Aggregates daily gridded climate data (Zarr format) spatially (e.g., to US states) and exports to Parquet/CSV.
+
+Key Features:
+  - Spatial Aggregation: Uses regionmask to compute mean/max/min by region (currently supports US states).
+
+  - Timedelta Support: Converts time-based variables (e.g., HeatwaveIndex) to numeric seconds.
+
+  - Output Formats: Saves results as Parquet (recommended) or CSV.
+
+  - Dask Integration: Handles large datasets via chunked processing.
+
+Inputs:
+  - Zarr store with daily climate data (must include latitude/longitude and a time dimension).
+
+  - Optional: Region filter (e.g., ['CA', 'TX']), timedelta variables to convert.
+
+Outputs:
+  - DataFrame with Date index and {variable}_{region} columns (e.g., Temperature_CA).
+
+  - Status dictionary with file paths or error details.
+
+Dependencies:
+  - xarray, pandas, regionmask, dask, zarr, pyarrow.
