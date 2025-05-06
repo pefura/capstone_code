@@ -74,3 +74,27 @@ Outputs:
 
 Dependencies:
   - xarray, pandas, regionmask, dask, zarr, pyarrow.
+
+
+# 4. Cultuvation wheat data in US
+wheat_table05_monthly_approx_200910_to_202425.csv
+
+# 5. Fertilizers prices and crude oil price
+commodities_prices_world_bank_fertilizers_oil_2010-01-01_to_2025-03-31.csv
+
+# 6. Farm prices for wheat in US
+all_wheat_monthly_prices_200910_to_202425.csv
+
+# 7. Supply and peoduction of wheat in US
+wheat_table05_monthly_approx_200910_to_202425.csv"
+
+# 8. Macroeconomic data
+fred_data_2010-01-01_to_2025-03-31.csv
+
+# 9. Geopolitical risk
+gpr_dataset.csv
+
+# 10. Financial data and interest rate-10y treasury bond yield (from yahoo finance)
+yfinance_data_Adj_Close_2010-01-01_to_2025-03-12.csv
+
+
