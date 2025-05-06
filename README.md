@@ -50,7 +50,7 @@ Highlights:
 
 💾 Output: multi-variable, consolidated Zarr data store for easy integration with machine learning pipelines.
 
-# 3. Function: process_climate_daily()
+# 3. Function: process_climate_daily_indices()
 Purpose: Aggregates daily gridded climate data (Zarr format) spatially (e.g., to US states) and exports to Parquet/CSV.
 
 Key Features:
