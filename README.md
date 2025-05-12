@@ -97,7 +97,7 @@ gpr_dataset.csv
 # 10. Financial data and interest rate-10y treasury bond yield (from yahoo finance)
 yfinance_data_Adj_Close_2010-01-01_to_2025-03-12.csv
 
-# 11 Merged dataset for futures wheat prices prediction
+# 11. Merged dataset for futures wheat prices prediction
 dataset : merged_wheat_predictors_W-MON_from_daily_climate_v4.csv
 
 # Wheat Supply and Production Dataset Documentation
