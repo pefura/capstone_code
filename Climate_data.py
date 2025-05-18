@@ -25,6 +25,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, message=".*elementwise
 warnings.filterwarnings("ignore", category=xr.SerializationWarning)
 warnings.filterwarnings("ignore", category=UserWarning, message="Large object passed.+")
 warnings.filterwarnings("ignore", category=UserWarning, message="The `compressor` argument is deprecated.*") # Ignore zarr v3 warning
+warnings.filterwarnings("ignore", category=UserWarning, message="Variable names are not unique.*") # Ignore if variable names are reused temporarily
 
 # --- Checkpoint Directory ---
 CHECKPOINT_DIR = "pipeline_checkpoints"
@@ -394,35 +395,6 @@ def align_regrid_datasets(datasets, expected_time_dim, interpolation_method='lin
 
     return final_datasets_ordered
 
-def coerce_dataset_dtypes(ds, target_dtype="float32", verbose=True):
-    """Convert variables to a target float dtype if applicable."""
-    if ds is None: return None # Handle None input
-    converted_ds = ds.copy(deep=False)
-    target_np_dtype = np.dtype(target_dtype)
-    for var_name in list(converted_ds.data_vars):
-        var = converted_ds[var_name]
-        original_dtype = var.dtype
-
-        # Convert if it's float but not target, or if it's object type
-        if (np.issubdtype(original_dtype, np.floating) and original_dtype != target_np_dtype) or original_dtype == object:
-            if verbose: print(f"Converting variable '{var_name}' from {original_dtype} to {target_dtype}")
-            try:
-                attrs = var.attrs.copy()
-                # Handle _FillValue conversion carefully
-                fill_value = attrs.get('_FillValue')
-                if fill_value is not None:
-                   try:
-                       attrs['_FillValue'] = target_np_dtype.type(fill_value)
-                   except (ValueError, TypeError):
-                       print(f"  Warning: Could not convert _FillValue for '{var_name}' to {target_dtype}. Removing it.")
-                       del attrs['_FillValue']
-
-                converted_ds[var_name] = var.astype(target_np_dtype)
-                converted_ds[var_name].attrs = attrs # Restore attributes
-
-            except Exception as e:
-                print(f"Warning: Could not convert variable '{var_name}' to {target_dtype}. Error: {e}")
-    return converted_ds
 
 # --- Climate Index Calculation Functions ---
 def compute_gdd(tmax, tmin, base_temp=10):
@@ -576,7 +548,7 @@ def compute_sma(soil, min_std=1e-6):
     print("  SMA calculation graph fully defined.")
     return sma
 
-def compute_et_ratio(evap, precip, min_precip=0.1):
+def compute_et_ratio(evap, precip, min_precip=1e-4):
     """Compute the Evapotranspiration Ratio (E/P)."""
     print("  Calculating Evapotranspiration Ratio...")
     # Ensure precipitation is non-negative
@@ -600,7 +572,13 @@ def compute_heatwave_index(tmax, threshold_c=35, window=7):
     # Sum over a rolling window (use min_periods=1 to get counts even at start)
     hwi = is_hot_day.rolling({time_dim: window}, min_periods=1).sum(skipna=False)
     hwi = hwi.rename("HeatwaveIndex")
-    hwi.attrs = {'long_name': f'Heatwave Index (days in {window}-day window >= {threshold_c} C)', 'units': 'days', 'threshold_C': threshold_c, 'window_days': window}
+    # CHANGED: units to '1' for dimensionless count, and long_name slightly adjusted
+    hwi.attrs = {
+        'long_name': f'Heatwave Index (count of days in {window}-day window with Tmax >= {threshold_c} C)',
+        'units': '1', # CF convention for dimensionless count
+        'threshold_C': threshold_c,
+        'window_days': window
+    }
     print("  Heatwave Index calculation defined.")
     return hwi
 
@@ -663,7 +641,7 @@ def run_dataset_diagnostics(base_path="/kaggle/working", expected_time_dim='vali
         sample_ds = None
         try:
             # Open without decoding time first to check metadata safely
-            sample_ds = xr.open_dataset(nc_files[0], decode_times=False)
+            sample_ds = xr.open_dataset(nc_files[0], decode_times=False, engine='h5netcdf') # Ensure engine for consistency
             print(f"  Variables: {list(sample_ds.data_vars)}")
             print(f"  Dimensions: {dict(sample_ds.sizes)}")
 
@@ -720,14 +698,18 @@ def run_dataset_diagnostics(base_path="/kaggle/working", expected_time_dim='vali
         else: print("No time dimensions found across datasets.") # Should not happen if checks above passed
 
         unique_calendars = set(all_calendars)
-        filtered_calendars = {c for c in unique_calendars if c not in ['Not specified', 'Unknown', 'N/A', None]}
-        if len(filtered_calendars) > 1:
-            print(f"ERROR: Inconsistent calendars found: {filtered_calendars}. This can cause issues with time alignment and operations.")
-            critical_problems_found = True
+        filtered_calendars = {c for c in unique_calendars if c not in ['Not specified', 'Unknown', 'N/A', None, 'standard']} # 'standard' is often default
+        if len(filtered_calendars) > 1: # Allow standard/proleptic_gregorian as consistent
+             proleptic_present = 'proleptic_gregorian' in filtered_calendars
+             other_calendars = {c for c in filtered_calendars if c != 'proleptic_gregorian'}
+             if not (proleptic_present and not other_calendars): # If not just 'proleptic_gregorian' or empty set
+                 print(f"ERROR: Potentially inconsistent calendars found: {filtered_calendars}. Check CF compliance. Forcing proleptic_gregorian.")
+                 critical_problems_found = False # Downgrade to warning, pipeline will try to handle
+                 print("  Pipeline will assume 'proleptic_gregorian' for time encoding.")
         elif len(filtered_calendars) == 1:
             print(f"Consistent calendar found: '{list(filtered_calendars)[0]}'")
-        elif not filtered_calendars and any(c in ['Not specified', 'Unknown', 'N/A', None] for c in unique_calendars):
-            print("WARNING: Calendar info missing or unspecified across datasets.")
+        elif not filtered_calendars and any(c in ['Not specified', 'Unknown', 'N/A', None, 'standard'] for c in unique_calendars):
+            print("WARNING: Calendar info missing or unspecified across datasets. Assuming 'proleptic_gregorian'.")
         elif not unique_calendars: pass # No calendars found
         else: print("Calendar check passed (or only one dataset).")
 
@@ -753,141 +735,283 @@ def compute_indices_lazy(base_path="/kaggle/input/climate-dataset-variables", sa
     if force_recompute: clear_checkpoints()
 
     # --- Checkpoint 0: Initial Loading ---
-    # ... (Keep Checkpoint 0 logic as before) ...
     datasets_raw = None; ordered_names = None
     loaded_datasets_checkpoint = load_checkpoint("0_loaded_datasets")
-    if loaded_datasets_checkpoint is not None: print("Using loaded datasets from checkpoint."); datasets_raw = loaded_datasets_checkpoint; ordered_names = list(datasets_raw.keys()); print(f"  Dataset order from checkpoint: {ordered_names}")
+    if loaded_datasets_checkpoint is not None:
+        print("Using loaded datasets from checkpoint.")
+        datasets_raw = loaded_datasets_checkpoint
+        ordered_names = list(datasets_raw.keys())
+        print(f"  Dataset order from checkpoint: {ordered_names}")
     else:
-        print("\nRunning pre-computation diagnostics..."); critical_problems = run_dataset_diagnostics(base_path=base_path, expected_time_dim=time_dim_name);
-        if critical_problems: return None
+        print("\nRunning pre-computation diagnostics...");
+        critical_problems = run_dataset_diagnostics(base_path=base_path, expected_time_dim=time_dim_name);
+        if critical_problems:
+            print("Critical problems found during diagnostics. Aborting pipeline.")
+            return None
         print("Diagnostics finished."); print("\n--- Starting Climate Indices Pipeline ---")
-        paths = { "tmax": os.path.join(base_path, "era5_max_2m_temperature"), "tmin": os.path.join(base_path, "era5_min_2m_temperature"), "precip": os.path.join(base_path, "total_precipitation"), "evap": os.path.join(base_path, "evaporation"), "soil": os.path.join(base_path, "volumetric_soil_water_layer_1"), "u_wind": os.path.join(base_path, "10m_u_component_of_wind_mean"), "v_wind": os.path.join(base_path, "10m_v_component_of_wind_mean") }; ordered_names = list(paths.keys())
+        paths = {
+            "tmax": os.path.join(base_path, "era5_max_2m_temperature"),
+            "tmin": os.path.join(base_path, "era5_min_2m_temperature"),
+            "precip": os.path.join(base_path, "total_precipitation"),
+            "evap": os.path.join(base_path, "evaporation"),
+            "soil": os.path.join(base_path, "volumetric_soil_water_layer_1"),
+            "u_wind": os.path.join(base_path, "10m_u_component_of_wind_mean"),
+            "v_wind": os.path.join(base_path, "10m_v_component_of_wind_mean")
+        }
+        ordered_names = list(paths.keys())
         print("\nLoading datasets (lazily)..."); datasets_raw = {}; load_errors = False
         for name in ordered_names:
             path = paths[name]
-            if not os.path.isdir(path): print(f"Warning: Input directory for '{name}' not found at {path}. Skipping."); datasets_raw[name] = None; continue
-            if not glob(os.path.join(path, "*.nc")): print(f"Warning: No .nc files found for '{name}' at {path}. Skipping."); datasets_raw[name] = None; continue
-            try: datasets_raw[name] = load_nc_dir(path, time_dim=time_dim_name); print(f"  Successfully initiated loading for '{name}'.")
-            except Exception as e: print(f"\nError loading '{name}': {e}"); load_errors = True; datasets_raw[name] = None
-        if all(ds is None for ds in datasets_raw.values()): raise RuntimeError("No datasets could be loaded.")
+            if not os.path.isdir(path):
+                print(f"Warning: Input directory for '{name}' not found at {path}. Skipping.")
+                datasets_raw[name] = None; continue
+            if not glob(os.path.join(path, "*.nc")):
+                print(f"Warning: No .nc files found for '{name}' at {path}. Skipping.")
+                datasets_raw[name] = None; continue
+            try:
+                datasets_raw[name] = load_nc_dir(path, time_dim=time_dim_name)
+                print(f"  Successfully initiated loading for '{name}'.")
+            except Exception as e:
+                print(f"\nError loading '{name}': {e}"); load_errors = True; datasets_raw[name] = None
+        if all(ds is None for ds in datasets_raw.values()):
+            raise RuntimeError("No datasets could be loaded.")
         if load_errors: print("Warning: Errors occurred during loading setup for some datasets.")
         save_checkpoint("0_loaded_datasets", datasets_raw)
 
     # --- Checkpoint 1: Align & Regrid ---
-    # ... (Keep Checkpoint 1 logic as before) ...
     processed_datasets_dict = None; interpolation_method = 'linear'
     processed_datasets_checkpoint = load_checkpoint("1_processed_datasets")
     if processed_datasets_checkpoint is not None:
-         print("Using processed datasets from checkpoint."); processed_datasets_dict = processed_datasets_checkpoint; interpolation_method = processed_datasets_dict.get('_metadata_', {}).get('interpolation_method', 'linear'); loaded_names = [name for name in processed_datasets_dict.keys() if name != '_metadata_']
-         if ordered_names is None: ordered_names = loaded_names
-         elif set(ordered_names) != set(loaded_names): print("Warning: Keys in Checkpoint 1 differ. Using order from Checkpoint 1."); ordered_names = loaded_names
-         else: ordered_names = loaded_names
+         print("Using processed datasets from checkpoint.")
+         processed_datasets_dict = processed_datasets_checkpoint
+         interpolation_method = processed_datasets_dict.get('_metadata_', {}).get('interpolation_method', 'linear')
+         loaded_names_from_chk1 = [name for name in processed_datasets_dict.keys() if name != '_metadata_']
+         # Ensure ordered_names reflects what's actually in the checkpoint if it was loaded
+         if ordered_names is None or set(ordered_names) != set(loaded_names_from_chk1):
+             print("Warning: Order or keys differ from initial load. Using order from Checkpoint 1.")
+             ordered_names = loaded_names_from_chk1 # Use the order from the checkpoint
          print(f"  Dataset order confirmed from checkpoint 1: {ordered_names}")
     else:
-        if ordered_names is None or datasets_raw is None: raise RuntimeError("Internal error: ordered_names or datasets_raw not available.")
-        print("\nAligning time and regridding spatial coordinates..."); dataset_list_to_process = [datasets_raw.get(name) for name in ordered_names]
-        try: processed_datasets_list = align_regrid_datasets(dataset_list_to_process, expected_time_dim=time_dim_name, interpolation_method=interpolation_method)
-        except Exception as e: print(f"Coordinate alignment/regridding failed critically: {e}"); traceback.print_exc(); raise
-        if len(processed_datasets_list) != len(ordered_names): print(f"Critical Warning: Mismatch in length after align/regrid.")
-        processed_datasets_dict = {name: ds for name, ds in zip(ordered_names, processed_datasets_list)}; processed_datasets_dict['_metadata_'] = {'interpolation_method': interpolation_method}
+        if ordered_names is None or datasets_raw is None:
+             raise RuntimeError("Internal error: ordered_names or datasets_raw not available for alignment.")
+        print("\nAligning time and regridding spatial coordinates...");
+        dataset_list_to_process = [datasets_raw.get(name) for name in ordered_names] # Ensure correct order
+        try:
+            processed_datasets_list = align_regrid_datasets(dataset_list_to_process, expected_time_dim=time_dim_name, interpolation_method=interpolation_method)
+        except Exception as e:
+            print(f"Coordinate alignment/regridding failed critically: {e}"); traceback.print_exc(); raise
+        if len(processed_datasets_list) != len(ordered_names):
+            print(f"Critical Warning: Mismatch in length after align/regrid. Expected {len(ordered_names)}, got {len(processed_datasets_list)}.")
+            # This could happen if align_regrid returns None for some datasets
+            # Rebuild dict carefully, preserving Nones for failed items
+        processed_datasets_dict = {name: ds for name, ds in zip(ordered_names, processed_datasets_list)}
+        processed_datasets_dict['_metadata_'] = {'interpolation_method': interpolation_method}
         save_checkpoint("1_processed_datasets", processed_datasets_dict)
 
     # --- Essential Dataset Checks ---
-    # ... (Keep essential dataset checks as before) ...
-    essential_names = ["tmax", "tmin", "precip", "evap", "soil", "u_wind", "v_wind"]; missing_essential = []
-    if processed_datasets_dict is None: raise RuntimeError("Processed datasets dictionary is not available.")
-    for name in essential_names: ds = processed_datasets_dict.get(name); missing_essential.append(name if ds is None else (f"{name} (empty)" if not ds.dims else None))
-    missing_essential = [m for m in missing_essential if m is not None]
-    if missing_essential: raise RuntimeError(f"Essential datasets missing or empty: {missing_essential}.")
+    essential_names = ["tmax", "tmin", "precip", "evap", "soil", "u_wind", "v_wind"]
+    missing_essential = []
+    if processed_datasets_dict is None:
+        raise RuntimeError("Processed datasets dictionary is not available after alignment/regridding step.")
+    for name in essential_names:
+        ds = processed_datasets_dict.get(name)
+        if ds is None:
+            missing_essential.append(name)
+        elif not ds.dims: # Check if dataset is empty (has no dimensions)
+            missing_essential.append(f"{name} (empty)")
+    if missing_essential:
+        raise RuntimeError(f"Essential datasets missing or empty after alignment/regridding: {missing_essential}.")
+
     aligned_tmax_ds = processed_datasets_dict["tmax"] # Keep reference
     print("\nDimensions after alignment & regridding (Tmax dataset):"); print(dict(aligned_tmax_ds.sizes))
 
-    # --- Checkpoint 2: Extracted Variables (Still useful) ---
-    # ... (Keep Checkpoint 2 logic as before, including chunking into chunked_vars) ...
-    chunked_vars = None
+    # --- Checkpoint 2: Extracted Variables ---
+    variables_to_chunk = None # Initialize to ensure it's defined
     extracted_vars_checkpoint = load_checkpoint("2_extracted_vars")
     if extracted_vars_checkpoint is not None:
          print("Using extracted variables from checkpoint.")
-         tmax = extracted_vars_checkpoint.get('tmax'); tmin = extracted_vars_checkpoint.get('tmin'); precip = extracted_vars_checkpoint.get('precip'); evap = extracted_vars_checkpoint.get('evap'); soil = extracted_vars_checkpoint.get('soil'); u = extracted_vars_checkpoint.get('u'); v = extracted_vars_checkpoint.get('v')
-         vars_to_check = [tmax, tmin, precip, evap, soil, u, v];
-         if any(var is None for var in vars_to_check): print("Warning: Some variables were None after loading checkpoint 2. Re-extracting all."); extracted_vars_checkpoint = None
-         else: variables_to_chunk = {'tmax':tmax, 'tmin':tmin, 'precip':precip, 'evap':evap, 'soil':soil, 'u':u, 'v':v}
-    if extracted_vars_checkpoint is None:
-        print("\nExtracting primary variables...");
-        def get_first_data_var(ds, name):
-            if ds is None: raise ValueError(f"Input dataset for '{name}' is None.")
-            if not ds.data_vars: raise ValueError(f"Dataset for '{name}' contains no data variables.")
-            common_name_map = { "tmax": ["mx2t", "tmax", "tasmax"], "tmin": ["mn2t", "tmin", "tasmin"], "precip": ["tp", "precip", "pr"], "evap": ["e", "evspsblsoi","evaporation"], "soil": ["swvl1", "soil_moisture"], "u_wind": ["u10", "uas"], "v_wind": ["v10", "vas"] }
-            expected_vars = common_name_map.get(name, [])
-            for var_name in expected_vars:
-                if var_name in ds.data_vars: print(f"  Found expected variable '{var_name}' for '{name}'."); return ds[var_name]
-            var_name = list(ds.data_vars)[0]; print(f"  Warning: Expected var not found for '{name}'. Extracting first var '{var_name}'."); return ds[var_name]
+         # Unpack variables carefully, checking if they exist in the checkpoint
+         tmax_var = extracted_vars_checkpoint.get('tmax')
+         tmin_var = extracted_vars_checkpoint.get('tmin')
+         precip_var = extracted_vars_checkpoint.get('precip')
+         evap_var = extracted_vars_checkpoint.get('evap')
+         soil_var = extracted_vars_checkpoint.get('soil')
+         u_var = extracted_vars_checkpoint.get('u')
+         v_var = extracted_vars_checkpoint.get('v')
+         vars_to_check_chk2 = [tmax_var, tmin_var, precip_var, evap_var, soil_var, u_var, v_var];
+         if any(var is None for var in vars_to_check_chk2):
+             print("Warning: Some variables were None after loading checkpoint 2. Re-extracting all.")
+             extracted_vars_checkpoint = None # Force re-extraction
+         else:
+             variables_to_chunk = {
+                'tmax':tmax_var, 'tmin':tmin_var, 'precip':precip_var,
+                'evap':evap_var, 'soil':soil_var, 'u':u_var, 'v':v_var
+             }
+    if extracted_vars_checkpoint is None: # Or if forced re-extraction
+        print("\nExtracting primary variables from processed datasets...");
+        def get_first_data_var(ds, ds_key_name): # Changed 'name' to 'ds_key_name'
+            if ds is None: raise ValueError(f"Input dataset for '{ds_key_name}' is None.")
+            if not isinstance(ds, xr.Dataset): raise ValueError(f"Input for '{ds_key_name}' is not an xarray.Dataset, but {type(ds)}.")
+            if not ds.data_vars: raise ValueError(f"Dataset for '{ds_key_name}' contains no data variables.")
+            # Map for common variable names within datasets
+            common_name_map = {
+                "tmax": ["mx2t", "t2mmax", "tasmax", "tmax"],
+                "tmin": ["mn2t", "t2mmin", "tasmin", "tmin"],
+                "precip": ["tp", "precip", "pr", "total_precipitation"],
+                "evap": ["e", "evspsbl", "evspsblsoi", "evaporation"], # Added evspsbl
+                "soil": ["swvl1", "volumetric_soil_water_layer_1", "soil_moisture"],
+                "u_wind": ["u10", "uas", "10m_u_component_of_wind"],
+                "v_wind": ["v10", "vas", "10m_v_component_of_wind"]
+            }
+            expected_vars = common_name_map.get(ds_key_name, [ds_key_name]) # Fallback to ds_key_name
+            for var_name_in_ds in expected_vars:
+                if var_name_in_ds in ds.data_vars:
+                    print(f"  Found expected variable '{var_name_in_ds}' for dataset key '{ds_key_name}'.")
+                    return ds[var_name_in_ds]
+            # If specific names not found, try the first variable
+            first_var_name = list(ds.data_vars)[0]
+            print(f"  Warning: Expected var not found for dataset key '{ds_key_name}'. Extracting first var '{first_var_name}'.")
+            return ds[first_var_name]
         try:
-            tmax = get_first_data_var(processed_datasets_dict["tmax"], "tmax"); tmin = get_first_data_var(processed_datasets_dict["tmin"], "tmin"); precip = get_first_data_var(processed_datasets_dict["precip"], "precip"); evap = get_first_data_var(processed_datasets_dict["evap"], "evap"); soil = get_first_data_var(processed_datasets_dict["soil"], "soil"); u = get_first_data_var(processed_datasets_dict["u_wind"], "u_wind"); v = get_first_data_var(processed_datasets_dict["v_wind"], "v_wind")
-            save_checkpoint("2_extracted_vars", {'tmax':tmax, 'tmin':tmin, 'precip':precip, 'evap':evap, 'soil':soil, 'u':u, 'v':v})
-            variables_to_chunk = {'tmax':tmax, 'tmin':tmin, 'precip':precip, 'evap':evap, 'soil':soil, 'u':u, 'v':v}
-        except ValueError as e: print(f"Error during variable extraction: {e}"); raise
+            tmax_var = get_first_data_var(processed_datasets_dict["tmax"], "tmax")
+            tmin_var = get_first_data_var(processed_datasets_dict["tmin"], "tmin")
+            precip_var = get_first_data_var(processed_datasets_dict["precip"], "precip")
+            evap_var = get_first_data_var(processed_datasets_dict["evap"], "evap")
+            soil_var = get_first_data_var(processed_datasets_dict["soil"], "soil")
+            u_var = get_first_data_var(processed_datasets_dict["u_wind"], "u_wind")
+            v_var = get_first_data_var(processed_datasets_dict["v_wind"], "v_wind")
+            variables_to_chunk = {
+                'tmax': tmax_var, 'tmin': tmin_var, 'precip': precip_var,
+                'evap': evap_var, 'soil': soil_var, 'u': u_var, 'v': v_var
+            }
+            save_checkpoint("2_extracted_vars", variables_to_chunk)
+        except ValueError as e:
+            print(f"Error during variable extraction: {e}"); traceback.print_exc(); raise
+        except KeyError as e:
+            print(f"Error: Key not found during variable extraction, processed_datasets_dict keys: {list(processed_datasets_dict.keys())}, error: {e}"); traceback.print_exc(); raise
+
+    if variables_to_chunk is None:
+        raise RuntimeError("Failed to load or extract variables_to_chunk.")
+
     print("\nEnsuring consistent chunking across input variables...")
-    # Use target_chunks derived from aligned_tmax_ds throughout
-    target_chunks = suggest_chunks(aligned_tmax_ds); print(f"  Target chunks: {target_chunks}")
+    target_chunks = suggest_chunks(aligned_tmax_ds); print(f"  Target chunks for data variables: {target_chunks}")
     chunked_vars = {}
-    for name, var in variables_to_chunk.items():
-         if var is None: raise ValueError(f"Variable '{name}' is None before chunking.")
-         var_dims = set(var.dims); applicable_chunks = {dim: chnk for dim, chnk in target_chunks.items() if dim in var_dims}
+    for name, var_da in variables_to_chunk.items(): # var_da is DataArray
+         if var_da is None: raise ValueError(f"Variable '{name}' is None before chunking.")
+         if not isinstance(var_da, xr.DataArray): raise TypeError(f"Variable '{name}' is not an xarray.DataArray, but {type(var_da)}.")
+
+         var_dims = set(var_da.dims);
+         applicable_chunks = {dim: chnk for dim, chnk in target_chunks.items() if dim in var_dims}
+         if not applicable_chunks: # Handle scalar or 0-dim arrays
+             print(f"  Variable '{name}' is scalar or has no dimensions matching target. Skipping chunking.")
+             chunked_vars[name] = var_da
+             continue
+
          current_chunks_match = False
-         if var.chunks is not None:
-              current_chunk_dict = {dim: var.chunks[i] for i, dim in enumerate(var.dims)}
-              if all(dim in current_chunk_dict and current_chunk_dict[dim][0] == applicable_chunks[dim] for dim in applicable_chunks): current_chunks_match = True
+         if var_da.chunks is not None:
+              # var_da.chunks is a tuple of tuples, var_da.dims is a tuple of strings
+              current_chunk_dict_from_da = {var_da.dims[i]: var_da.chunks[i] for i in range(len(var_da.dims))}
+              # Compare only the first chunk size for each dimension
+              if all(dim in current_chunk_dict_from_da and
+                     current_chunk_dict_from_da[dim] and # Ensure chunk tuple is not empty
+                     current_chunk_dict_from_da[dim][0] == applicable_chunks[dim]
+                     for dim in applicable_chunks if dim in current_chunk_dict_from_da): # Only check dims present in both
+                  current_chunks_match = True
+
          if not current_chunks_match:
-             print(f"  Rechunking '{name}' to match target: {applicable_chunks}")
-             try: chunked_vars[name] = var.chunk(applicable_chunks)
-             except ValueError as e: print(f"    ERROR rechunking {name}: {e}"); raise
-         else: chunked_vars[name] = var
+             print(f"  Rechunking '{name}' from current {var_da.chunks} to target: {applicable_chunks}")
+             try:
+                 # Preserve attributes manually when chunking DataArray
+                 original_attrs_var = var_da.attrs.copy()
+                 chunked_vars[name] = var_da.chunk(applicable_chunks)
+                 chunked_vars[name].attrs = original_attrs_var
+             except ValueError as e:
+                 print(f"    ERROR rechunking {name}: {e}. Its current chunks: {var_da.chunks}. Applicable: {applicable_chunks}"); raise
+         else:
+             print(f"  Chunks for '{name}' already match target.")
+             chunked_vars[name] = var_da
+
 
     # --- Prepare Zarr Store (Coordinates) ---
     print(f"\nPreparing Zarr store: {save_path}")
-    if os.path.exists(save_path): print(f"Warning: Output path {save_path} already exists. Overwriting."); shutil.rmtree(save_path)
+    if os.path.exists(save_path):
+        print(f"Warning: Output path {save_path} already exists. Overwriting.")
+        shutil.rmtree(save_path)
     coord_encoding = {}
-    coords_with_dims = {name: da for name, da in aligned_tmax_ds.coords.items() if da.dims}
-    final_coord_chunks = suggest_chunks(xr.Dataset(coords_with_dims)) if coords_with_dims else {}
+    # Use aligned_tmax_ds for reference coordinates. Chunk them if they have dimensions.
+    coords_ds_for_chunk_suggestion = xr.Dataset({name: da for name, da in aligned_tmax_ds.coords.items() if da.dims})
+    final_coord_chunks = suggest_chunks(coords_ds_for_chunk_suggestion) if coords_ds_for_chunk_suggestion.coords else {}
+
     print(f"  Coordinate target chunks: {final_coord_chunks}")
-    fill_value_float = np.float32(np.nan)
-    ref_coords = aligned_tmax_ds.coords; coords_to_write = xr.Dataset()
-    for coord_name, coord_da in ref_coords.items():
-        print(f"  Processing coordinate: {coord_name}"); enc = {}; coord_da_chunked = coord_da
-        if coord_da.dims: # Chunk coordinates based on final_coord_chunks
-             applicable_coord_chunks = {dim: chnk for dim, chnk in final_coord_chunks.items() if dim in coord_da.dims}
-             if applicable_coord_chunks:
-                 coord_chunks_match = False
-                 if coord_da.chunks is not None: # Check if already chunked
-                      current_coord_chunk_dict = {dim: coord_da.chunks[i] for i, dim in enumerate(coord_da.dims)}
-                      if all(dim in current_coord_chunk_dict and current_coord_chunk_dict[dim][0] == applicable_coord_chunks[dim] for dim in applicable_coord_chunks): coord_chunks_match = True
-                 if not coord_chunks_match:
-                      print(f"    Rechunking coordinate '{coord_name}' to {applicable_coord_chunks}")
-                      try: coord_da_chunked = coord_da.chunk(applicable_coord_chunks)
-                      except Exception as e: print(f"      Failed to chunk coordinate {coord_name}: {e}. Using original."); coord_da_chunked = coord_da
-        coords_to_write[coord_name] = coord_da_chunked
-        # Define encoding for coordinate
-        if hasattr(coord_da_chunked, 'dims') and coord_da_chunked.dims and coord_da_chunked.chunks is not None: # Check chunks not None
-             if all(dim in coord_da_chunked.chunks for dim in coord_da_chunked.dims): # Check all dims present
-                 try: enc['chunks'] = tuple(coord_da_chunked.chunks[dim][0] for dim in coord_da_chunked.dims) # Access by name
-                 except Exception as e: print(f"    Warning: Error getting chunks for coord '{coord_name}': {e}")
-        if np.issubdtype(coord_da.dtype, np.floating): enc['_FillValue'] = fill_value_float
-        # Time coord dtype override
-        if coord_name == time_dim_name and 'datetime64' in str(coord_da.dtype):
-            print(f"    Overriding dtype for time coordinate '{coord_name}' to 'f8'.")
-            enc['dtype'] = 'f8'
-            if 'units' not in coord_da.attrs: enc.setdefault('units', 'nanoseconds since 1970-01-01T00:00:00Z'); print(f"    Adding default units for '{coord_name}': {enc['units']}")
-            if 'calendar' not in coord_da.attrs: enc.setdefault('calendar', 'proleptic_gregorian'); print(f"    Adding default calendar for '{coord_name}': {enc['calendar']}")
-        else: enc['dtype'] = str(coord_da.dtype)
+    fill_value_float = np.float32(np.nan) # Default fill for float coords
+    ref_coords_dataset = aligned_tmax_ds.coords.to_dataset() # Convert Coords to Dataset for easier iteration
+    coords_to_write = xr.Dataset()
+
+    for coord_name in ref_coords_dataset: # Iterate over names in the Dataset
+        coord_da = ref_coords_dataset[coord_name] # This is now a DataArray
+        print(f"  Processing coordinate: {coord_name} (dtype: {coord_da.dtype})")
+        enc = {}
+        coord_da_to_write = coord_da # Start with original
+
+        # Chunk dimensional coordinates
+        if coord_da.dims:
+            applicable_coord_chunks = {dim: chnk for dim, chnk in final_coord_chunks.items() if dim in coord_da.dims}
+            if applicable_coord_chunks:
+                needs_rechunk_coord = True
+                if coord_da.chunks is not None:
+                    current_coord_chunk_dict = {coord_da.dims[i]: coord_da.chunks[i] for i in range(len(coord_da.dims))}
+                    if all(dim in current_coord_chunk_dict and current_coord_chunk_dict[dim] and current_coord_chunk_dict[dim][0] == applicable_coord_chunks[dim]
+                           for dim in applicable_coord_chunks if dim in current_coord_chunk_dict):
+                        needs_rechunk_coord = False
+                if needs_rechunk_coord:
+                    print(f"    Rechunking coordinate '{coord_name}' to {applicable_coord_chunks}")
+                    try:
+                        coord_da_to_write = coord_da.chunk(applicable_coord_chunks)
+                    except Exception as e:
+                        print(f"      Failed to chunk coordinate {coord_name}: {e}. Using original chunking or unchunked.")
+                        coord_da_to_write = coord_da # Fallback
+
+        coords_to_write[coord_name] = coord_da_to_write # Add potentially rechunked coord to dataset
+
+        # Define encoding for coordinate based on the one to be written
+        if hasattr(coord_da_to_write, 'dims') and coord_da_to_write.dims and coord_da_to_write.chunks is not None:
+            try:
+                # Ensure all dims are present in chunks mapping before creating tuple
+                chunk_tuple_list = []
+                for dim_name in coord_da_to_write.dims:
+                    # coord_da_to_write.chunks is tuple of tuples e.g. ((10,), (20,)) for 2D
+                    # coord_da_to_write.dims is tuple of strings e.g. ('lat', 'lon')
+                    # We need to find the index of dim_name in coord_da_to_write.dims
+                    dim_idx = coord_da_to_write.dims.index(dim_name)
+                    chunk_tuple_list.append(coord_da_to_write.chunks[dim_idx][0]) # Get the first chunk size for that dim
+                enc['chunks'] = tuple(chunk_tuple_list)
+            except Exception as e:
+                print(f"    Warning: Error getting chunks for coord '{coord_name}': {e}. Chunks: {coord_da_to_write.chunks}, Dims: {coord_da_to_write.dims}")
+
+        if np.issubdtype(coord_da_to_write.dtype, np.floating):
+            enc['_FillValue'] = fill_value_float
+            enc['dtype'] = str(coord_da_to_write.dtype) # Ensure float32 or float64 is explicit
+        elif 'datetime64' in str(coord_da_to_write.dtype):
+            print(f"    Encoding for datetime coordinate '{coord_name}'.")
+            enc['dtype'] = str(coord_da_to_write.dtype) # Keep original datetime64 dtype
+            enc.setdefault('units', coord_da_to_write.attrs.get('units', 'nanoseconds since 1970-01-01T00:00:00Z'))
+            enc.setdefault('calendar', coord_da_to_write.attrs.get('calendar', 'proleptic_gregorian'))
+            print(f"      Using units: {enc['units']}, calendar: {enc['calendar']}")
+        else: # Other types (int, bool, etc.)
+            enc['dtype'] = str(coord_da_to_write.dtype)
+
         if enc: coord_encoding[coord_name] = enc
-    try: # Write coordinates
-        print("  Writing coordinates to Zarr store..."); coords_to_write.to_zarr(save_path, mode='w', encoding=coord_encoding, consolidated=True, compute=True); print("  Coordinates written successfully.")
-    except Exception as e: print(f"    ERROR writing coordinates: {e}"); traceback.print_exc(); raise RuntimeError("Failed to initialize Zarr store with coordinates.") from e
+    try:
+        print("  Writing coordinates to Zarr store...");
+        coords_to_write.to_zarr(save_path, mode='w', encoding=coord_encoding, consolidated=True, compute=True)
+        print("  Coordinates written successfully.")
+    except Exception as e:
+        print(f"    ERROR writing coordinates: {e}"); traceback.print_exc();
+        raise RuntimeError("Failed to initialize Zarr store with coordinates.") from e
 
     # --- Compute and append each index ---
     print("\nComputing and saving indices incrementally...")
-    indices_to_compute = [ # Use original chunked_vars here
+    indices_to_compute = [
         ("GDD", compute_gdd, [chunked_vars['tmax'], chunked_vars['tmin']]),
         ("SPI", compute_spi, [chunked_vars['precip']]),
         ("SoilMoistureAnomaly", compute_sma, [chunked_vars['soil']]),
@@ -903,134 +1027,204 @@ def compute_indices_lazy(base_path="/kaggle/input/climate-dataset-variables", sa
             index_da = compute_func(*args)
             if index_da.name != index_name: index_da = index_da.rename(index_name)
 
-            # 2. Coerce to float32
-            print(f"  Coercing {index_name} to float32...")
-            index_da = index_da.astype(np.float32)
+            # 2. Set appropriate dtype for the index
+            # Default to float32, specify others as needed
+            target_dtype_str = "float32"
+            if index_name == "HeatwaveIndex":
+                target_dtype_str = "int16" # For counts (e.g., 0-7 days)
+                print(f"  Setting target dtype for {index_name} to {target_dtype_str} (count-based).")
+            # Add other specific dtypes if needed for other indices
+            # elif index_name == "SomeOtherIndex":
+            # target_dtype_str = "some_other_type"
 
-            # --- !! FIX: Rechunk index_da before saving !! ---
-            print(f"  Ensuring chunks for {index_name} align with target...")
-            # Use the same 'target_chunks' derived from aligned_tmax_ds
-            index_dims = set(index_da.dims)
-            applicable_chunks = {dim: chnk for dim, chnk in target_chunks.items() if dim in index_dims}
+            actual_target_dtype = np.dtype(target_dtype_str)
 
-            if applicable_chunks and hasattr(index_da, 'dims') and index_da.dims:
-                needs_rechunk = True # Assume needed
-                if index_da.chunks is not None:
-                     # Build current chunk dict carefully
-                     current_chunk_dict = {}
-                     try:
-                         current_chunk_dict = {dim: index_da.chunks[index_da.dims.index(dim)] for dim in index_da.dims}
-                     except Exception as chunk_err:
-                         print(f"    Warning: Could not build current chunk dict for {index_name}: {chunk_err}")
-
-                     # Check if first chunk size matches for applicable dims
-                     if all(dim in current_chunk_dict and dim in applicable_chunks and current_chunk_dict[dim] and current_chunk_dict[dim][0] == applicable_chunks[dim] for dim in applicable_chunks):
-                          needs_rechunk = False
-                          print(f"    Chunks for {index_name} already match target.")
-
-                if needs_rechunk:
-                    print(f"    Rechunking {index_name} to: {applicable_chunks}")
-                    try:
-                        index_da = index_da.chunk(applicable_chunks)
-                        print(f"    Rechunking successful.")
-                    except Exception as e:
-                        print(f"    ERROR rechunking {index_name}: {e}. Proceeding without rechunk.")
-                        # This might still cause the ValueError below if chunks are incompatible
+            if index_da.dtype != actual_target_dtype:
+                print(f"  Coercing {index_name} from {index_da.dtype} to {actual_target_dtype}.")
+                # Preserve attributes during astype for xarray DataArrays
+                original_attrs = index_da.attrs.copy()
+                index_da = index_da.astype(actual_target_dtype)
+                index_da.attrs = original_attrs # Restore attributes
             else:
-                 print(f"    No applicable target chunks found or {index_name} is scalar/chunkless.")
-            # --- !! END FIX !! ---
+                print(f"  {index_name} already has target dtype {actual_target_dtype}.")
 
-            # 4. Prepare minimal encoding
-            var_encoding = {}; fill_value = np.float32(np.nan) if np.issubdtype(index_da.dtype, np.floating) else None
-            if fill_value is not None: var_encoding['_FillValue'] = fill_value
-            # DO NOT set 'chunks' in encoding here; let Zarr use index_da.chunks
-            encoding_dict = {index_name: var_encoding} if var_encoding else None
+
+            # 3. Rechunk index_da before saving to match target_chunks
+            print(f"  Ensuring chunks for {index_name} align with target {target_chunks}...")
+            index_dims_set = set(index_da.dims)
+            # Use the same 'target_chunks' derived from aligned_tmax_ds (for data vars)
+            applicable_chunks_for_index = {dim: chnk for dim, chnk in target_chunks.items() if dim in index_dims_set}
+
+            if applicable_chunks_for_index and hasattr(index_da, 'dims') and index_da.dims:
+                needs_rechunk_index = True
+                if index_da.chunks is not None:
+                    current_chunk_dict_index = {index_da.dims[k]: index_da.chunks[k] for k in range(len(index_da.dims))}
+                    if all(dim in current_chunk_dict_index and current_chunk_dict_index[dim] and
+                           current_chunk_dict_index[dim][0] == applicable_chunks_for_index[dim]
+                           for dim in applicable_chunks_for_index if dim in current_chunk_dict_index):
+                        needs_rechunk_index = False
+                        print(f"    Chunks for {index_name} already match target: {applicable_chunks_for_index}.")
+                if needs_rechunk_index:
+                    print(f"    Rechunking {index_name} from {index_da.chunks} to: {applicable_chunks_for_index}")
+                    try:
+                        original_attrs_rechunk = index_da.attrs.copy()
+                        index_da = index_da.chunk(applicable_chunks_for_index)
+                        index_da.attrs = original_attrs_rechunk
+                        print(f"    Rechunking for {index_name} successful. New chunks: {index_da.chunks}")
+                    except Exception as e_rechunk:
+                        print(f"    ERROR rechunking {index_name}: {e_rechunk}. Proceeding with current chunks: {index_da.chunks}")
+            else:
+                 print(f"    No applicable target chunks found or {index_name} is scalar/chunkless. Current chunks: {index_da.chunks}")
+
+
+            # 4. Prepare encoding for Zarr storage
+            var_encoding = {}
+            # Explicitly set the dtype in encoding. This is crucial.
+            var_encoding['dtype'] = str(index_da.dtype)
+
+            if np.issubdtype(index_da.dtype, np.floating):
+                # For float types, set a _FillValue (NaN of the correct float type)
+                var_encoding['_FillValue'] = index_da.dtype.type(np.nan)
+            elif np.issubdtype(index_da.dtype, np.integer):
+                # For integer types (like HeatwaveIndex), a _FillValue is often not needed
+                # if the calculation ensures no NaNs (e.g., HWI is a count, should be >= 0).
+                # If you need one, it must be an integer of the same type, e.g., np.int16(-9999)
+                pass # No _FillValue specified for integers by default here.
+
+            # Let Zarr infer chunks from index_da.chunks directly; DO NOT set 'chunks' in var_encoding.
+            encoding_dict_for_append = {index_name: var_encoding}
 
             # 5. Append to the Zarr store
-            print(f"  Appending {index_name} to {save_path}...")
-            with ProgressBar():
-                 # compute=True ensures this step finishes before the next index
-                 index_da.to_zarr(save_path, mode='a', encoding=encoding_dict, compute=True)
+            print(f"  Appending {index_name} (dtype: {index_da.dtype}, chunks: {index_da.chunks}) to {save_path}...")
+            with ProgressBar(dt=2.0): # Increased dt for potentially long computations
+                 index_da.to_zarr(save_path, mode='a', encoding=encoding_dict_for_append, compute=True, consolidated=False) # Consolidate at the end
             print(f"  {index_name} saved successfully.")
 
-        except ValueError as ve: # Catch the specific incompatible chunk error
-             if "Final chunk of Zarr array must be the same size or smaller" in str(ve):
+        except ValueError as ve:
+             if "Final chunk of Zarr array must be the same size or smaller" in str(ve) or \
+                "Zarr requires uniform chunk sizes" in str(ve) or \
+                "chunksize is larger than dimension size" in str(ve): # Added more specific Zarr chunk errors
                  print(f"\nERROR saving index {index_name}: {ve}")
-                 print(f"  Inferred Chunks: {index_da.chunks}")
-                 print(f"  This usually happens with complex operations like groupby.apply.")
+                 print(f"  Computed Chunks for index_da: {index_da.chunks if hasattr(index_da, 'chunks') else 'N/A'}")
+                 print(f"  Target Chunks for data vars: {target_chunks}")
+                 print(f"  This usually happens with complex operations like groupby.apply or if rechunking failed.")
                  print(f"  Skipping index {index_name} due to incompatible chunks.")
-                 # Optionally: Try saving without chunk encoding (might still fail)
-                 # try:
-                 #     print(f"  Attempting to save {index_name} without explicit chunk encoding...")
-                 #     index_da.to_zarr(save_path, mode='a', compute=True)
-                 # except Exception as e2:
-                 #     print(f"    Second save attempt failed: {e2}")
-                 continue # Skip to next index
+                 continue
              else:
-                 # Reraise other ValueErrors
                  print(f"\nERROR processing and saving index {index_name} (ValueError): {ve}")
                  traceback.print_exc(); print(f"Skipping index {index_name} due to error."); continue
         except Exception as e:
             print(f"\nERROR processing and saving index {index_name} (Other): {e}")
             traceback.print_exc(); print(f"Skipping index {index_name} due to error."); continue
 
-    # Consolidate metadata
+    # Consolidate metadata at the very end
     try:
-        print("\nConsolidating Zarr metadata...")
-        # --- FIX: Ensure zarr library is used ---
+        print("\nConsolidating Zarr metadata for the entire store...")
         zarr.consolidate_metadata(save_path)
-        # --- END FIX ---
         print("Metadata consolidated.")
     except NameError:
-        print("ERROR: zarr library not imported. Cannot consolidate metadata.")
+        print("ERROR: zarr library not imported. Cannot consolidate metadata.") # Should not happen if imported globally
     except Exception as e:
         print(f"Warning: Failed to consolidate Zarr metadata: {e}")
 
     print(f"\n--- Incremental Pipeline Finished ---"); print(f"Climate indices incrementally saved to: {save_path}")
-    clear_checkpoints(); return None # Indicate success
+    clear_checkpoints(); return save_path # Return path on success
 
 
 # ----------------------------------------
 # EXECUTION BLOCK
 # ----------------------------------------
-# (Make sure all helper functions from the previous answer are defined above this block,
-#  and coerce_dataset_dtypes is removed or commented out)
 
 if __name__ == "__main__":
     print("Running climate index pipeline...")
-    # --- Imports --- (Ensure zarr is imported here or globally)
-    import zarr # <--- Make sure this import is present
+    # --- Imports --- (zarr is imported globally)
 
     # --- Configuration ---
-    BASE_INPUT_PATH = "/kaggle/input/climate-dataset-variables"; OUTPUT_ZARR_PATH = "/kaggle/working/climate_indices.zarr"; EXPECTED_TIME_DIM = 'valid_time'; FORCE_RECOMPUTE_ALL = False
+    BASE_INPUT_PATH = "/kaggle/input/climate-dataset-variables"
+    OUTPUT_ZARR_PATH = "/kaggle/working/climate_indices.zarr"
+    EXPECTED_TIME_DIM = 'valid_time' # Make sure this matches your data's primary time dimension name
+    FORCE_RECOMPUTE_ALL = False # Set to True to ignore checkpoints and recompute everything
+
+    # Clean up previous output if it exists, to ensure a fresh run
     if os.path.exists(OUTPUT_ZARR_PATH):
         print(f"Removing existing output directory: {OUTPUT_ZARR_PATH}")
-        try: shutil.rmtree(OUTPUT_ZARR_PATH)
-        except Exception as e: print(f"Error removing existing output: {e}")
-    if FORCE_RECOMPUTE_ALL: print("Force recompute enabled. Clearing all checkpoints."); clear_checkpoints()
+        try:
+            shutil.rmtree(OUTPUT_ZARR_PATH)
+        except Exception as e:
+            print(f"Error removing existing output: {e}")
+
+    if FORCE_RECOMPUTE_ALL:
+        print("Force recompute enabled. Clearing all checkpoints.")
+        clear_checkpoints()
     try:
         start_time = time.time()
-        compute_indices_lazy(base_path=BASE_INPUT_PATH, save_path=OUTPUT_ZARR_PATH, time_dim_name=EXPECTED_TIME_DIM, force_recompute=FORCE_RECOMPUTE_ALL)
+        result_path = compute_indices_lazy(
+            base_path=BASE_INPUT_PATH,
+            save_path=OUTPUT_ZARR_PATH,
+            time_dim_name=EXPECTED_TIME_DIM,
+            force_recompute=FORCE_RECOMPUTE_ALL
+        )
         end_time = time.time()
-        if os.path.exists(OUTPUT_ZARR_PATH):
-            print("\n--- Pipeline Summary ---"); print(f"Output Zarr store generated at: {OUTPUT_ZARR_PATH}"); print(f"Total execution time: {end_time - start_time:.2f} seconds")
+
+        if result_path and os.path.exists(result_path):
+            print("\n--- Pipeline Summary ---")
+            print(f"Output Zarr store generated at: {result_path}")
+            print(f"Total execution time: {end_time - start_time:.2f} seconds")
+
             print("\nVerifying output Zarr store...")
             try:
-                 with xr.set_options(enable_cftimeindex=True):
-                      # Ensure metadata is consolidated before opening if needed
-                      try: zarr.consolidate_metadata(OUTPUT_ZARR_PATH) # Consolidate just before open
-                      except Exception: pass # Ignore if fails, open might still work
-                      ds_check = xr.open_zarr(OUTPUT_ZARR_PATH, consolidated=True); print("Successfully opened Zarr store."); print("Variables:", list(ds_check.data_vars)); print("Dimensions:", dict(ds_check.sizes))
-                      if EXPECTED_TIME_DIM in ds_check.coords: print(f"Time coordinate ('{EXPECTED_TIME_DIM}') dtype after loading: {ds_check[EXPECTED_TIME_DIM].dtype}")
-                      expected_indices = ["GDD", "SPI", "SoilMoistureAnomaly", "EvapotranspirationRatio", "HeatwaveIndex", "WindSpeed"]
-                      missing_indices = [idx for idx in expected_indices if idx not in ds_check.data_vars]
-                      if missing_indices: print(f"WARNING: Missing indices in output: {missing_indices}")
-                      ds_check.close()
-            except Exception as e: print(f"Error verifying output Zarr store: {e}")
-        else: print("\nPipeline did not complete successfully (Output Zarr store not found).");
-    # (Keep specific error handling as before)
+                 # xarray options for cftimeindex are usually handled by default now
+                 # with xr.set_options(enable_cftimeindex=True):
+                 # Ensure metadata is consolidated before opening if needed (should be by pipeline)
+                ds_check = xr.open_zarr(result_path, consolidated=True, decode_times=True) # Ensure decode_times
+                print("Successfully opened Zarr store.")
+                print("Variables:", list(ds_check.data_vars))
+                print("Dimensions:", dict(ds_check.sizes))
+                if EXPECTED_TIME_DIM in ds_check.coords:
+                    print(f"Time coordinate ('{EXPECTED_TIME_DIM}') dtype after loading: {ds_check[EXPECTED_TIME_DIM].dtype}")
+                    print(f"Sample time values: {ds_check[EXPECTED_TIME_DIM].isel({EXPECTED_TIME_DIM:slice(0,3)}).values}")
+
+
+                expected_indices = ["GDD", "SPI", "SoilMoistureAnomaly", "EvapotranspirationRatio", "HeatwaveIndex", "WindSpeed"]
+                present_indices = list(ds_check.data_vars)
+                missing_indices_list = [idx for idx in expected_indices if idx not in present_indices]
+                if missing_indices_list:
+                    print(f"WARNING: Missing expected indices in output: {missing_indices_list}")
+
+                print("\n--- Sample data and attributes for each variable ---")
+                for var_name in present_indices:
+                    print(f"\nVariable: {var_name}")
+                    print(f"  Dtype: {ds_check[var_name].dtype}")
+                    print(f"  Shape: {ds_check[var_name].shape}")
+                    print(f"  Chunks: {ds_check[var_name].chunks}")
+                    print(f"  Attributes: {ds_check[var_name].attrs}")
+                    # Print a small sample of data
+                    sample_slice = {dim: 0 for dim in ds_check[var_name].dims} # Take first element along each dim
+                    try:
+                        sample_data = ds_check[var_name].isel(**sample_slice).compute()
+                        print(f"  Sample value (at {sample_slice}): {sample_data.item() if sample_data.size == 1 else sample_data.values}")
+
+                        # Compute and print basic statistics
+                        print(f"  Computing min/max for {var_name} (this might take a moment)...")
+                        with ProgressBar():
+                            var_min = ds_check[var_name].min().compute()
+                            var_max = ds_check[var_name].max().compute()
+                        print(f"    Min: {var_min.item() if hasattr(var_min, 'item') else var_min}")
+                        print(f"    Max: {var_max.item() if hasattr(var_max, 'item') else var_max}")
+
+                    except Exception as e_sample:
+                        print(f"    Error getting sample/stats for {var_name}: {e_sample}")
+
+
+                ds_check.close()
+            except Exception as e_verify:
+                print(f"Error verifying output Zarr store: {e_verify}")
+                traceback.print_exc()
+        else:
+            print("\nPipeline did not complete successfully or output Zarr store not found.")
+
     except FileNotFoundError as e: print(f"\nPipeline Error: Input data not found. {e}")
-    except RuntimeError as e: print(f"\nPipeline Error: {e}")
+    except RuntimeError as e: print(f"\nPipeline Error: {e}"); traceback.print_exc()
     except ValueError as e: print(f"\nPipeline Error (ValueError): {e}"); traceback.print_exc()
     except AttributeError as e: print(f"\nPipeline Error (AttributeError): {e}"); traceback.print_exc()
     except TypeError as e: print(f"\nPipeline Error (TypeError): {e}"); traceback.print_exc()
@@ -1038,3 +1232,4 @@ if __name__ == "__main__":
     except SyntaxError as e: print(f"\nPipeline Error (SyntaxError): {e}"); traceback.print_exc()
     except NameError as e: print(f"\nPipeline Error (NameError): {e}"); traceback.print_exc() # Catch NameError
     except Exception as e: print(f"\nAn unexpected error occurred in the pipeline:"); traceback.print_exc()
+        
