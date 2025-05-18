@@ -100,8 +100,6 @@ yfinance_data_Adj_Close_2010-01-01_to_2025-03-12.csv
 # 11. Merged dataset for futures wheat prices prediction
 dataset : merged_wheat_predictors_W-MON_from_daily_climate_v4.csv
 
-# Wheat Supply and Production Dataset Documentation
-
 ## Overview
 This dataset combines multiple data sources to create a comprehensive weekly dataset for wheat supply and production analysis. The data is merged and aligned to a weekly frequency (W-MON) from various daily, monthly, and quarterly sources.
 
