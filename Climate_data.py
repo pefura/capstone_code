@@ -1232,4 +1232,3 @@ if __name__ == "__main__":
     except SyntaxError as e: print(f"\nPipeline Error (SyntaxError): {e}"); traceback.print_exc()
     except NameError as e: print(f"\nPipeline Error (NameError): {e}"); traceback.print_exc() # Catch NameError
     except Exception as e: print(f"\nAn unexpected error occurred in the pipeline:"); traceback.print_exc()
-        
